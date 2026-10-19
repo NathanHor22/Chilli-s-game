@@ -38,6 +38,10 @@ class DiscoverySnapshot:
     # Successful scan number; errors preserve the last successful inventory.
     generation: int = 0
     updated_at: float = 0.0
+    # Completed attempts, including failures; unlike generation this lets a UI
+    # distinguish a failed Refresh from a request that has not finished yet.
+    revision: int = 0
+    error: bool = False
 
 
 def enumerate_connected_cameras() -> tuple[CameraInfo, ...]:
@@ -92,7 +96,7 @@ def enumerate_connected_cameras() -> tuple[CameraInfo, ...]:
 class CameraDiscovery:
     """One daemon scans periodically; UI reads and refresh requests never wait."""
 
-    def __init__(self, refresh_seconds: float = 4.0, *, enumerate_fn: Callable[[], tuple[CameraInfo, ...]] | None = None) -> None:
+    def __init__(self, refresh_seconds: float = 2.0, *, enumerate_fn: Callable[[], tuple[CameraInfo, ...]] | None = None) -> None:
         if not math.isfinite(refresh_seconds) or refresh_seconds <= 0:
             raise ValueError("refresh_seconds must be positive")
         self.refresh_seconds = refresh_seconds
@@ -103,13 +107,15 @@ class CameraDiscovery:
         self._thread: threading.Thread | None = None
         self._snapshot = DiscoverySnapshot()
         self._scan_started: float | None = None
+        self._requested_serial = 0
+        self._completed_serial = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._wake_event.clear()
         with self._lock:
+            self._requested_serial += 1
             self._snapshot = replace(self._snapshot, scanning=True, status="Looking for cameras...")
         self._thread = threading.Thread(target=self._run, name="chilli-camera-discovery", daemon=True)
         self._thread.start()
@@ -118,6 +124,9 @@ class CameraDiscovery:
         if self._thread is None or not self._thread.is_alive():
             self.start()
         else:
+            with self._lock:
+                self._requested_serial += 1
+                self._snapshot = replace(self._snapshot, scanning=True, status="Looking for cameras...")
             self._wake_event.set()
 
     def stop(self) -> None:
@@ -136,37 +145,54 @@ class CameraDiscovery:
             return snapshot
 
     def _run(self) -> None:
+        next_scan_at = 0.0
         while not self._stop_event.is_set():
-            self._wake_event.clear()
             with self._lock:
-                self._scan_started = time.monotonic()
-                self._snapshot = replace(self._snapshot, scanning=True, status="Looking for cameras...")
+                now = time.monotonic()
+                pending = self._requested_serial > self._completed_serial
+                delay = next_scan_at - now
+                if not pending and delay > 0:
+                    # Refresh increments its serial under this same lock before
+                    # setting the event. Clearing here cannot erase a request.
+                    self._wake_event.clear()
+                    should_scan = False
+                else:
+                    should_scan = True
+                    scan_serial = self._requested_serial
+                    self._scan_started = now
+                    self._snapshot = replace(self._snapshot, scanning=True, status="Looking for cameras...")
+            if not should_scan:
+                self._wake_event.wait(delay)
+                continue
+            cameras = None
+            error = False
             try:
                 cameras = tuple(self._enumerate())
-                with self._lock:
-                    if self._stop_event.is_set():
-                        return
-                    count = len(cameras)
-                    self._snapshot = DiscoverySnapshot(
-                        cameras=cameras, status=f"{count} camera{'s' if count != 1 else ''} found" if count else "No cameras found. Plug in a webcam.",
-                        generation=self._snapshot.generation + 1, updated_at=time.monotonic(),
-                    )
+                count = len(cameras)
+                status = f"{count} camera{'s' if count != 1 else ''} found" if count else "No cameras found. Plug in a webcam."
             except (ImportError, OSError) as exc:
-                with self._lock:
-                    if self._stop_event.is_set():
-                        return
-                    self._snapshot = replace(self._snapshot, scanning=False,
-                                             status=f"Camera discovery unavailable ({type(exc).__name__}); run setup.ps1")
+                error = True
+                status = f"Camera discovery unavailable ({type(exc).__name__}); run setup.ps1"
             except Exception as exc:
-                with self._lock:
-                    if self._stop_event.is_set():
-                        return
-                    self._snapshot = replace(self._snapshot, scanning=False,
-                                             status=f"Camera scan failed ({type(exc).__name__}); refresh to retry")
-            finally:
-                with self._lock:
-                    self._scan_started = None
-            self._wake_event.wait(self.refresh_seconds)
+                error = True
+                status = f"Camera scan failed ({type(exc).__name__}); refresh to retry"
+            with self._lock:
+                self._scan_started = None
+                if self._stop_event.is_set():
+                    return
+                self._completed_serial = max(self._completed_serial, scan_serial)
+                # Requests received during enumeration must receive a later
+                # scan, even if the just-completed result found no devices.
+                pending = self._requested_serial > self._completed_serial
+                completed_at = time.monotonic()
+                old = self._snapshot
+                self._snapshot = DiscoverySnapshot(
+                    cameras=old.cameras if cameras is None else cameras,
+                    scanning=pending, status="Looking for cameras..." if pending else status,
+                    generation=old.generation + (0 if error else 1), updated_at=completed_at,
+                    revision=old.revision + 1, error=error,
+                )
+                next_scan_at = completed_at + self.refresh_seconds
 
 
 class CameraSession:

@@ -8,3 +8,4 @@ dist/
 models/*.task
 models/*.part
 artifacts/
+results.json

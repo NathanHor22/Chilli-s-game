@@ -21,6 +21,8 @@ class DemoController:
 
     LEFT_KEYS = frozenset((pygame.K_LEFT, pygame.K_a))
     RIGHT_KEYS = frozenset((pygame.K_RIGHT, pygame.K_d))
+    UP_KEYS = frozenset((pygame.K_UP, pygame.K_w))
+    DOWN_KEYS = frozenset((pygame.K_DOWN, pygame.K_s))
     START_KEYS = frozenset((pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE))
     TAP_SECONDS = 0.12
     STANCE_OFFSET = 0.18
@@ -33,7 +35,9 @@ class DemoController:
         self.game = game
         self.active = False
         self.x = 0.5
+        self.hand_y = 0.8
         self.direction = 0
+        self.hand_direction = 0
         self._held: set[int] = set()
         self._pulses: dict[int, float] = {}
         self._start_held: set[int] = set()
@@ -42,6 +46,7 @@ class DemoController:
         self._held.clear()
         self._pulses.clear()
         self.direction = 0
+        self.hand_direction = 0
 
     def reset(self, now: float) -> None:
         """Start/retry with the full configured instructions and countdown.
@@ -52,6 +57,7 @@ class DemoController:
         """
         self.active = True
         self.x = 0.5
+        self.hand_y = 0.8
         self._clear_movement()
         settled_at = now - self.game.config.settle_seconds
         self.game.reset(settled_at)
@@ -86,7 +92,7 @@ class DemoController:
                 self.reset(now)
             return
 
-        if key in self.LEFT_KEYS | self.RIGHT_KEYS and self.active:
+        if key in self.LEFT_KEYS | self.RIGHT_KEYS | self.UP_KEYS | self.DOWN_KEYS and self.active:
             if key not in self._held:
                 self._pulses[key] = now + self.TAP_SECONDS
             self._held.add(key)
@@ -108,16 +114,26 @@ class DemoController:
         self.x = max(self.MIN_X, min(self.MAX_X, self.x))
         if abs(self.x - target) < 1e-7:
             self.x = target
-        return PoseSample(now, self.active, x=self.x, scale=0.2, lean=(self.x - 0.5) * 0.6)
+        up = bool(pressing & self.UP_KEYS)
+        down = bool(pressing & self.DOWN_KEYS)
+        self.hand_direction = int(down) - int(up) if self.active else 0
+        hand_target = 0.8 + 1.4 * self.hand_direction
+        hand_step = (hand_target - self.hand_y) * -math.expm1(-dt / self.RESPONSE_SECONDS)
+        hand_limit = 5.0 * min(dt, 0.1)
+        self.hand_y += max(-hand_limit, min(hand_limit, hand_step))
+        if abs(self.hand_y - hand_target) < 1e-7:
+            self.hand_y = hand_target
+        return PoseSample(now, self.active, x=self.x, scale=0.2, lean=(self.x - 0.5) * 0.6,
+                          right_hand=(0.8, self.hand_y))
 
     def hint(self, state: str | None = None) -> str:
         state = state or self.game.state
         if not self.active or state == "idle":
             return "Press ENTER or SPACE to start"
         if state == "instructions":
-            return "Sway LEFT and RIGHT, or use A and D. Your round starts shortly"
+            return "Sway LEFT/RIGHT or wave UP/DOWN. Your round starts shortly"
         if state == "countdown":
-            return "Get ready! Alternate LEFT and RIGHT, or A and D"
+            return "Get ready! Sway LEFT/RIGHT or wave UP/DOWN (WASD works too)"
         if state == "playing":
-            return "Alternate LEFT / RIGHT or A / D to grow the chilli"
+            return "Sway LEFT/RIGHT or wave UP/DOWN (WASD works too)"
         return "Press ENTER or SPACE to play again"

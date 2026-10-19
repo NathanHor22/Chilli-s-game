@@ -1,3 +1,3 @@
-"""Chilli Shimmy: a small, offline motion-controlled installation."""
+"""How HOT are you: a small, offline motion-controlled installation."""
 
-__version__ = "1.2.0"
+__version__ = "1.4.1"

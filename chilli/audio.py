@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from array import array
 import math
+import random
 import pygame
 
 
@@ -11,6 +12,10 @@ class Audio:
         self.enabled = enabled
         self.available = False
         self.sounds = {}
+        self.volume = max(0., min(1., volume))
+        self._sizzle_channel = None
+        self._seen_impact = 0
+        self._last_impact = -math.inf
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
@@ -31,15 +36,63 @@ class Audio:
                 sound = pygame.mixer.Sound(buffer=pcm.tobytes())
                 sound.set_volume(volume)
                 self.sounds[name] = sound
+            for name, duration in (("pop", .10), ("boing", .19), ("sizzle", 1.0)):
+                pcm = array("h")
+                count = int(rate*duration)
+                rng = random.Random(74)
+                phase = 0.
+                for i in range(count):
+                    t = i/rate
+                    envelope = min(1., i/(rate*.004), (count-i)/(rate*.012))
+                    if name == "sizzle":
+                        value = 5200*rng.uniform(-1., 1.)*(.65+.35*math.sin(t*math.tau*17)**2)
+                    else:
+                        frequency = (850-600*t/duration if name == "pop"
+                                     else 150+90*math.sin(t*math.tau*9)*math.exp(-t*10))
+                        phase += math.tau*frequency/rate
+                        value = 10000*math.sin(phase)*math.exp(-t*18)
+                    pcm.extend([int(value*envelope)]*channels)
+                sound = pygame.mixer.Sound(buffer=pcm.tobytes())
+                sound.set_volume(1. if name == "sizzle" else self.volume*.7)
+                self.sounds[name] = sound
+            pygame.mixer.set_reserved(1)
+            self._sizzle_channel = pygame.mixer.Channel(0)
             self.available = True
         except pygame.error:
             pass  # A disconnected speaker must never stop the installation.
 
     def play(self, name: str):
         if self.enabled and self.available and name in self.sounds:
-            self.sounds[name].play()
+            try:
+                self.sounds[name].play()
+            except pygame.error:
+                self.available = False
+
+    def update(self, now, *, playing=False, heat=0., energy=0., impact_serial=0):
+        """One quiet heat loop plus rate-limited pops; no new buffers per frame."""
+        changed = impact_serial != self._seen_impact
+        self._seen_impact = impact_serial
+        if not self.available:
+            return
+        try:
+            if not self.enabled or not playing:
+                self._sizzle_channel.stop()
+                return
+            heat = max(0., min(1., heat))
+            energy = max(0., min(1., energy))
+            if not self._sizzle_channel.get_busy():
+                self._sizzle_channel.play(self.sounds["sizzle"], loops=-1)
+            self._sizzle_channel.set_volume(self.volume*(.04 + .20*heat + .08*energy))
+            if changed and now-self._last_impact >= .16:
+                self.play("pop" if energy > .65 else "boing")
+                self._last_impact = now
+        except pygame.error:
+            self.available = False
 
     def toggle(self):
         self.enabled = not self.enabled
         if not self.enabled and self.available:
-            pygame.mixer.stop()
+            try:
+                pygame.mixer.stop()
+            except pygame.error:
+                self.available = False

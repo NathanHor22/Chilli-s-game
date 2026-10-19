@@ -1,8 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-if exist "ChilliShimmy.exe" (
-    "ChilliShimmy.exe" %*
+if exist "HowHotAreYou.exe" (
+    "HowHotAreYou.exe" %*
 ) else if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" main.py %*
 ) else (

@@ -21,6 +21,7 @@ class CameraSetup:
         self._generation = -1
         self._missing = False
         self._started = False
+        self._refresh_revision = None
 
     def start(self):
         self.enabled = True
@@ -28,8 +29,17 @@ class CameraSetup:
             self.discovery.start()
             self._started = True
         self.session.set_preview_enabled(True)
-        self.session.start()
+        if not self._missing:
+            self.session.start()
         self.discovery.refresh()
+
+    def refresh(self):
+        """Queue a metadata rescan and expose its pending state immediately."""
+        self._refresh_revision = self.discovery.snapshot().revision
+        self.discovery.refresh()
+        self._started = True
+        self.inventory = self.discovery.snapshot()
+        self.notice = "Refreshing connected webcams..."
 
     def suspend(self):
         self.enabled = False
@@ -71,13 +81,18 @@ class CameraSetup:
 
     def update(self, now=None):
         """Return True when a hardware change requires returning to setup."""
+        now = time.monotonic() if now is None else now
         changed = False
         old_inventory = self.inventory
         self.inventory = self.discovery.snapshot()
+        current = self.session.snapshot()
+        if (self._refresh_revision is not None and not self.inventory.scanning
+                and self.inventory.revision > self._refresh_revision):
+            if self.notice == "Refreshing connected webcams...":
+                self.notice = self.inventory.status
+            self._refresh_revision = None
         if self.enabled and self.inventory.generation != self._generation:
             self._generation = self.inventory.generation
-            if self.notice == "Refreshing connected webcams...":
-                self.notice = ""
             cameras = self.inventory.cameras
             t = self.config.tracking
             if t.camera_path:
@@ -96,31 +111,61 @@ class CameraSetup:
                         changed = True
                     else:
                         self.selected = match
+            elif self.selected is not None and self.selected.backend != 0:
+                # Some virtual cameras have no persistent path. Pin their
+                # backend/index/name and require review after disappearance;
+                # a different device reusing that index is not the selection.
+                match = next((c for c in cameras if c.index == self.selected.index
+                              and c.backend == self.selected.backend and c.name == self.selected.name), None)
+                if match is None and self.inventory.generation > 0:
+                    if not self._missing:
+                        self.session.suspend()
+                        self.notice = "Selected webcam disconnected. Choose another source or reconnect it."
+                        self._missing = True
+                        changed = True
+                elif match is not None:
+                    if self._missing or match != self.selected:
+                        self.select(match)
+                        self.notice = "Camera connection changed. Check the preview before starting."
+                        changed = True
+                    else:
+                        self.selected = match
             elif cameras:
                 match = next((c for c in cameras if c.index == t.camera_index
                               and t.camera_backend in (0, c.backend)), None)
-                if match is not None:
+                healthy = self._camera_live(current, now)
+                if match is None and self.selected is None and not healthy:
+                    # Fresh installation / previously empty inventory. A
+                    # newly attached camera need not receive index zero.
+                    match = cameras[0]
+                if match is not None and (not healthy or self.selected is None):
+                    # Initial default capture may become live before metadata
+                    # arrives. Bind its matching configured index once so the
+                    # operator sees a selected row and Save stores an identity.
+                    # Explicit manual choices stay untouched while healthy.
                     if self.selected is None or match != self.selected:
                         self.select(match)
                         changed = True
                     else:
                         self.selected = match
             old_ids = {c.identity for c in old_inventory.cameras}
-            if old_inventory.generation > 0 and any(c.identity not in old_ids for c in cameras) and not changed:
+            if (old_inventory.generation > 0 and not self._missing
+                    and any(c.identity not in old_ids for c in cameras) and not changed):
                 self.notice = "New webcam detected. Select it from Camera Source to switch."
         self.snapshot = self.session.snapshot()
-        if self.notice == "Refreshing connected webcams..." and not self.inventory.scanning:
-            self.notice = self.inventory.status
         if self.snapshot.ready and self.notice == "Reconnecting to the selected camera...":
             self.notice = ""
         return changed
 
+    def _camera_live(self, snapshot, now):
+        sample = snapshot.sample
+        return bool(snapshot.ready and sample is not None
+                    and 0 <= now-sample.timestamp <= self.config.game.stale_seconds)
+
     def can_start(self, now=None):
         now = time.monotonic() if now is None else now
-        sample = self.snapshot.sample
         return bool(self.enabled and not self._missing and self.snapshot.ready
-                    and self.snapshot.preview is not None and sample is not None
-                    and 0 <= now-sample.timestamp <= self.config.game.stale_seconds)
+                    and self.snapshot.preview is not None and self._camera_live(self.snapshot, now))
 
     def save(self):
         save_camera_selection(self.config, self.config_path)

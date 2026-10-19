@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -54,6 +54,94 @@ class PoseGeometryTests(unittest.TestCase):
         self.assertTrue(sample.present)
         self.assertAlmostEqual(sample.scale, math.hypot(0.28, 0.075))
 
+    def test_wrists_use_crop_mapped_shoulder_relative_coordinates(self):
+        result = pose_result()
+        result.pose_landmarks[0][15].x, result.pose_landmarks[0][15].y = 0.1, 0.6
+        result.pose_landmarks[0][16].x, result.pose_landmarks[0][16].y = 0.9, 0.1
+        sample, landmarks, _ = self.sample(result)
+        self.assertAlmostEqual(landmarks[15][0], 0.22)
+        self.assertAlmostEqual(landmarks[16][0], 0.78)
+        self.assertAlmostEqual(sample.left_hand[0], -1.0)
+        self.assertAlmostEqual(sample.left_hand[1], 0.3 * 0.75 / 0.28)
+        self.assertAlmostEqual(sample.right_hand[0], 1.0)
+        self.assertAlmostEqual(sample.right_hand[1], -0.2 * 0.75 / 0.28)
+
+    def test_full_frame_counts_wrists_outside_torso_zone_near_image_edges(self):
+        result = pose_result()
+        result.pose_landmarks[0][15].x, result.pose_landmarks[0][15].y = 0.02, 0.08
+        result.pose_landmarks[0][16].x, result.pose_landmarks[0][16].y = 0.98, 0.92
+        sample, landmarks, _ = _pose_sample(result, 10, TrackingConfig(), 640, 480, 0, 640)
+        self.assertTrue(sample.present)
+        for actual, expected in zip(landmarks[15] + landmarks[16], (0.02, 0.08, 0.98, 0.92)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(sample.left_hand[0], -1.2)
+        self.assertAlmostEqual(sample.right_hand[0], 1.2)
+        self.assertLess(sample.left_hand[1], 0)
+        self.assertGreater(sample.right_hand[1], 0)
+
+    def test_full_frame_still_rejects_torso_outside_the_play_zone(self):
+        result = pose_result()
+        result.pose_landmarks[0][11].x = 0.01
+        result.pose_landmarks[0][12].x = 0.19
+        result.pose_landmarks[0][23].x = 0.06
+        result.pose_landmarks[0][24].x = 0.14
+        sample, _, status = _pose_sample(result, 10, TrackingConfig(), 640, 480, 0, 640)
+        self.assertFalse(sample.present)
+        self.assertIn("centre of the play area", status)
+        self.assertIsNone(sample.left_hand)
+        self.assertIsNone(sample.right_hand)
+
+    def test_hand_axes_use_actual_frame_aspect_and_tilted_shoulder_span(self):
+        result = pose_result()
+        result.pose_landmarks[0][12].y = 0.4
+        result.pose_landmarks[0][15].x, result.pose_landmarks[0][15].y = 0.8, 0.55
+        sample, _, _ = _pose_sample(result, 10, TrackingConfig(), 1280, 720, 192, 896)
+        span = math.hypot(0.28, 0.1 * 720 / 1280)
+        self.assertAlmostEqual(sample.left_hand[0], 0.21 / span)
+        self.assertAlmostEqual(sample.left_hand[1], 0.2 * 720 / 1280 / span)
+
+    def test_translating_whole_body_does_not_move_relative_hands(self):
+        result = pose_result()
+        result.pose_landmarks[0][15].x, result.pose_landmarks[0][15].y = 0.1, 0.6
+        result.pose_landmarks[0][16].x, result.pose_landmarks[0][16].y = 0.8, 0.1
+        before, _, _ = self.sample(result)
+        for point in result.pose_landmarks[0]:
+            point.x += 0.05
+            point.y += 0.05
+        after, _, _ = self.sample(result)
+        self.assertNotEqual(before.x, after.x)
+        for old, new in zip(before.left_hand + before.right_hand, after.left_hand + after.right_hand):
+            self.assertAlmostEqual(old, new)
+
+    def test_one_unreliable_wrist_is_absent_without_hiding_the_body_or_other_hand(self):
+        for field, value in (("visibility", 0.2), ("presence", 0.2), ("visibility", None),
+                             ("x", float("nan")), ("x", -0.01), ("y", 1.01)):
+            with self.subTest(field=field, value=value):
+                result = pose_result()
+                setattr(result.pose_landmarks[0][15], field, value)
+                sample, landmarks, _ = self.sample(result)
+                self.assertTrue(sample.present)
+                self.assertIsNone(sample.left_hand)
+                self.assertIsNotNone(sample.right_hand)
+                self.assertEqual(landmarks[15], (-1.0, -1.0))
+
+    def test_body_tracking_does_not_require_visible_hands(self):
+        result = pose_result()
+        result.pose_landmarks[0][15].visibility = 0.1
+        result.pose_landmarks[0][16].presence = 0.1
+        sample, _, _ = self.sample(result)
+        self.assertTrue(sample.present)
+        self.assertIsNone(sample.left_hand)
+        self.assertIsNone(sample.right_hand)
+
+    def test_hands_do_not_create_a_player_without_a_reliable_torso(self):
+        result = pose_result()
+        result.pose_landmarks[0][23].visibility = 0.1
+        sample, _, _ = self.sample(result)
+        self.assertFalse(sample.present)
+        self.assertIsNone(sample.left_hand)
+        self.assertIsNone(sample.right_hand)
+
     def test_missing_pose_is_explicitly_absent(self):
         sample, landmarks, _ = self.sample(SimpleNamespace(pose_landmarks=[]))
         self.assertFalse(sample.present)
@@ -101,12 +189,94 @@ class TrackerLifecycleTests(unittest.TestCase):
 
     def test_preview_can_be_removed_without_mutating_old_snapshot(self):
         tracker = CameraTracker()
-        original = TrackingSnapshot(ready=True, preview=object(), landmarks=((0.5, 0.5),))
+        sample = PoseSample(time.monotonic(), True, left_hand=(-1, 1), right_hand=(1, 1))
+        original = TrackingSnapshot(sample=sample, ready=True, preview=object(), landmarks=((0.5, 0.5),))
         tracker._publish(original)
         tracker.set_preview_enabled(False)
         self.assertIsNone(tracker.snapshot().preview)
-        self.assertEqual(tracker.snapshot().landmarks, ())
+        self.assertEqual(tracker.snapshot().landmarks, original.landmarks)
+        self.assertIs(tracker.snapshot().sample, sample)
         self.assertIsNotNone(original.preview)
+
+    def test_pose_worker_supplies_hands_and_landmarks_without_preview_or_a_second_model(self):
+        # This fake SDK exposes only PoseLandmarker. Any attempt to construct a
+        # second hand detector fails, as does preview resizing when disabled.
+        class Frame:
+            shape = (480, 640, 3)
+
+            def __getitem__(self, key):
+                raise AssertionError("Hand tracking must use the full camera frame")
+
+        class BaseOptions:
+            Delegate = SimpleNamespace(CPU=0)
+
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        detector = Mock()
+        result = pose_result()
+        result.pose_landmarks[0][15].x = 0.02
+        result.pose_landmarks[0][16].x = 0.98
+        detector.detect_for_video.return_value = result
+        factory = Mock(return_value=detector)
+        options_factory = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+        vision = SimpleNamespace(PoseLandmarkerOptions=options_factory,
+                                 PoseLandmarker=SimpleNamespace(create_from_options=factory),
+                                 RunningMode=SimpleNamespace(VIDEO=1))
+        mp = ModuleType("mediapipe")
+        mp.Image = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+        mp.ImageFormat = SimpleNamespace(SRGB=1)
+        task_module = ModuleType("mediapipe.tasks")
+        python_module = ModuleType("mediapipe.tasks.python")
+        python_module.BaseOptions = BaseOptions
+        python_module.vision = vision
+        task_module.python = python_module
+        cv2 = SimpleNamespace(COLOR_BGR2RGB=1, flip=lambda frame, _: frame,
+                              cvtColor=lambda frame, _: frame)
+        modules = {"cv2": cv2, "mediapipe": mp, "mediapipe.tasks": task_module,
+                   "mediapipe.tasks.python": python_module}
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "pose.task"
+            model.touch()
+            tracker = CameraTracker(TrackingConfig(model_path=str(model), fps=60))
+
+            def capture(_):
+                sequence = 0
+                while not tracker._stop_event.is_set():
+                    sequence += 1
+                    with tracker._lock:
+                        tracker._camera_generation = 1
+                        tracker._latest_frame = (sequence, time.monotonic(), Frame())
+                    tracker._frame_event.set()
+                    tracker._stop_event.wait(0.01)
+
+            tracker._capture = capture
+            with patch.dict("sys.modules", modules):
+                try:
+                    tracker.start()
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        snapshot = tracker.snapshot()
+                        if snapshot.sample is not None and snapshot.sample.present:
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(snapshot.ready, snapshot.status)
+                    self.assertTrue(snapshot.sample.present, snapshot.status)
+                    self.assertIsNotNone(snapshot.sample.left_hand)
+                    self.assertIsNotNone(snapshot.sample.right_hand)
+                    self.assertAlmostEqual(snapshot.sample.left_hand[0], -1.2)
+                    self.assertAlmostEqual(snapshot.sample.right_hand[0], 1.2)
+                    self.assertEqual(len(snapshot.landmarks), 33)
+                    self.assertIsNone(snapshot.preview)
+                    self.assertTrue(mp.Image.call_args_list)
+                    for call in mp.Image.call_args_list:
+                        self.assertEqual(call.kwargs["data"].shape, (480, 640, 3))
+                    factory.assert_called_once()
+                    self.assertEqual(options_factory.call_args.kwargs["num_poses"], 1)
+                    self.assertFalse(options_factory.call_args.kwargs["output_segmentation_masks"])
+                finally:
+                    tracker.stop()
+            detector.close.assert_called_once()
 
     def test_windows_camera_fallback_releases_failed_backend(self):
         attempts = []

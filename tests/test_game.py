@@ -4,8 +4,8 @@ import unittest
 from chilli.game import Game, GameConfig, PoseSample
 
 
-def pose(t, x=0.5, scale=0.2, lean=0.0, present=True):
-    return PoseSample(t, present, x, scale, lean)
+def pose(t, x=0.5, scale=0.2, lean=0.0, present=True, left_hand=None, right_hand=None):
+    return PoseSample(t, present, x, scale, lean, left_hand, right_hand)
 
 
 class GameTests(unittest.TestCase):
@@ -35,6 +35,129 @@ class GameTests(unittest.TestCase):
         self.assertEqual(game.state, "timeout")
         self.assertEqual(game.remaining, 0)
 
+    def test_explicit_begin_shows_instructions_without_faking_a_player(self):
+        game = Game(GameConfig())
+        game.begin(100)
+        self.assertEqual(game.state, "instructions")
+        self.assertFalse(game.player_visible)
+        self.assertEqual(game.message, "Step into the play area")
+        self.assertEqual(game.heat, 0)
+        self.assertEqual(game.remaining, 10)
+        self.assertEqual(game.countdown, 0)
+        self.assertEqual(game.round_number, 0)
+
+    def test_explicit_begin_waits_for_late_camera_and_player_without_using_timer(self):
+        game = Game(GameConfig())
+        game.begin(100)
+        for t in (100, 101, 110):
+            game.update(t, None, camera_ready=False)
+            self.assertEqual(game.state, "instructions")
+            self.assertEqual(game.message, "Connect a camera in Settings")
+            self.assertEqual(game.remaining, 10)
+            self.assertEqual(game.heat, 0)
+        game.update(111, pose(111, present=False))
+        self.assertEqual(game.state, "instructions")
+        self.assertEqual(game.message, "Step into the play area")
+        for i in range(10):
+            t = 120 + i / 10
+            game.update(t, pose(t))
+            self.assertEqual(game.state, "instructions")
+            self.assertEqual(game.remaining, 10)
+        game.update(121, pose(121))
+        self.assertEqual(game.state, "countdown")
+        self.assertEqual(game.countdown, 3)
+        for i in range(1, 31):
+            t = 121 + i / 10
+            game.update(t, pose(t))
+        self.assertEqual(game.state, "playing")
+        self.assertEqual(game.remaining, 10)
+        self.assertEqual(game.heat, 0)
+
+    def test_explicit_begin_keeps_full_tutorial_even_when_player_is_ready(self):
+        game = Game(GameConfig(target_motion=0.001))
+        game.begin(0)
+        for i in range(40):
+            t = i / 10
+            game.update(t, pose(t, 0.5 + 0.1 * math.sin(t * math.tau)))
+            self.assertEqual(game.state, "instructions")
+            self.assertEqual(game.message, "Your turn in a moment")
+            self.assertEqual(game.remaining, 10)
+            self.assertEqual(game.heat, 0)
+        game.update(4, pose(4))
+        self.assertEqual(game.state, "countdown")
+        self.assertEqual(game.countdown, 3)
+        for i in range(41, 71):
+            t = i / 10
+            game.update(t, pose(t))
+        self.assertEqual(game.state, "playing")
+        self.assertEqual(game.remaining, 10)
+        self.assertEqual(game.heat, 0)
+
+    def test_explicit_tutorial_waits_after_departure_and_rechecks_presence(self):
+        game = Game(GameConfig())
+        game.begin(0)
+        game.update(0, pose(0))
+        game.update(0.2, pose(0.2, present=False))
+        game.update(4, pose(4, present=False))
+        self.assertEqual(game.state, "instructions")
+        self.assertEqual(game.message, "Step into the play area")
+        for i in range(50, 60):
+            t = i / 10
+            game.update(t, pose(t))
+            self.assertEqual(game.state, "instructions")
+        game.update(6, pose(6))
+        self.assertEqual(game.state, "countdown")
+        self.assertEqual(game.countdown, 3)
+        self.assertEqual(game.remaining, 10)
+
+    def test_explicit_begin_cannot_count_a_pose_gap_as_settled_presence(self):
+        game = Game(GameConfig(instructions_seconds=0))
+        game.begin(0)
+        game.update(0, pose(0))
+        game.update(5, pose(5))
+        self.assertEqual(game.state, "instructions")
+        for i in range(51, 60):
+            t = i / 10
+            game.update(t, pose(t))
+            self.assertEqual(game.state, "instructions")
+        game.update(6, pose(6))
+        self.assertEqual(game.state, "countdown")
+        self.assertEqual(game.countdown, 3)
+
+    def test_explicit_countdown_loss_returns_to_waiting_tutorial(self):
+        for loss in ("absent", "camera", "gap"):
+            with self.subTest(loss=loss):
+                game = Game(GameConfig())
+                game.begin(0)
+                for i in range(41):
+                    t = i / 10
+                    game.update(t, pose(t))
+                self.assertEqual(game.state, "countdown")
+                if loss == "absent":
+                    game.update(4.1, pose(4.1, present=False))
+                elif loss == "camera":
+                    game.update(4.1, None, camera_ready=False)
+                else:
+                    game.update(4.7, pose(4.7))
+                self.assertEqual(game.state, "instructions")
+                self.assertEqual(game.remaining, 10)
+                self.assertEqual(game.heat, 0)
+                self.assertEqual(game.round_number, 0)
+                game.update(10, None, camera_ready=False)
+                self.assertEqual(game.state, "instructions")
+                self.assertEqual(game.message, "Connect a camera in Settings")
+
+    def test_explicit_begin_resets_progress_from_a_previous_round(self):
+        game = self.start(target_motion=100)
+        game.update(0.1, pose(0.1, 0.53))
+        self.assertGreater(game.heat, 0)
+        game.begin(0.2)
+        self.assertEqual(game.state, "instructions")
+        self.assertEqual(game.heat, 0)
+        self.assertEqual(game.remaining, 10)
+        self.assertFalse(game.player_visible)
+        self.assertEqual(game.round_number, 1)
+
     def test_stationary_and_small_tracking_jitter_do_not_score(self):
         for jitter in (0.0, 0.002):
             with self.subTest(jitter=jitter):
@@ -56,6 +179,147 @@ class GameTests(unittest.TestCase):
         self.assertEqual(game.heat, 1.0)
         self.assertGreater(game.remaining, 0)
         self.assertLessEqual(abs(game.sway), 1.0)
+
+    def hand_game(self, *, left_hand=(0.8, 0.8), right_hand=None, **kwargs):
+        game = Game(GameConfig(settle_seconds=0, instructions_seconds=0, countdown_seconds=0, **kwargs))
+        game.update(0, pose(0, left_hand=left_hand, right_hand=right_hand))
+        self.assertEqual(game.state, "playing")
+        return game
+
+    def test_one_hand_can_win_with_horizontal_vertical_or_diagonal_waves(self):
+        for direction in ((1, 0), (0, 1), (math.sqrt(0.5), math.sqrt(0.5))):
+            with self.subTest(direction=direction):
+                game = self.hand_game()
+                for i in range(1, 300):
+                    t = i / 30
+                    offset = 1.4 * math.sin(t * math.tau * 0.7)
+                    hand = (0.8 + direction[0] * offset, 0.8 + direction[1] * offset)
+                    game.update(t, pose(t, left_hand=hand))
+                    if game.state == "won":
+                        break
+                self.assertEqual(game.state, "won")
+                self.assertEqual(game.heat, 1)
+                self.assertGreater(game.remaining, 0)
+
+    def test_stationary_hands_and_small_wrist_jitter_do_not_score(self):
+        for amplitude in (0, 0.012):
+            with self.subTest(amplitude=amplitude):
+                game = self.hand_game(left_hand=(-0.8, 0.8), right_hand=(0.8, 0.8))
+                for i in range(1, 300):
+                    t = i / 30
+                    jitter = amplitude * (-1) ** i
+                    game.update(t, pose(t, left_hand=(-0.8 + jitter, 0.8 - jitter),
+                                        right_hand=(0.8 - jitter, 0.8 + jitter)))
+                self.assertEqual(game.heat, 0)
+                self.assertEqual(game.motion_energy, 0)
+
+    def test_opposing_hands_retain_energy_and_dominant_direction(self):
+        game = self.hand_game(left_hand=(-0.8, 0.8), right_hand=(0.8, 0.8))
+        game.update(0.1, pose(0.1, left_hand=(-0.8, 1.2), right_hand=(0.8, 0.4)))
+        self.assertGreater(game.heat, 0)
+        self.assertGreater(game.motion_energy, 0.5)
+        self.assertGreater(abs(game.motion_y), 0.5)
+        self.assertAlmostEqual(game.motion_x, 0)
+        self.assertEqual(game.motion_timestamp, 0.1)
+
+    def test_hand_occlusion_and_reappearance_never_award_missing_travel(self):
+        game = self.hand_game(target_motion=100)
+        game.update(0.1, pose(0.1, left_hand=(0.8, 1.2)))
+        earned = game.heat
+        self.assertGreater(earned, 0)
+        game.update(0.2, pose(0.2))
+        self.assertEqual(game.heat, earned)
+        self.assertEqual(game.motion_energy, 0)
+        game.update(0.3, pose(0.3, left_hand=(-2, -1)))
+        game.update(0.4, pose(0.4, left_hand=(-2, -1)))
+        self.assertEqual(game.heat, earned)
+        self.assertEqual(game.motion_energy, 0)
+
+    def test_visible_hand_keeps_scoring_when_other_hand_is_occluded(self):
+        game = self.hand_game(left_hand=(-0.8, 0.8), right_hand=(0.8, 0.8), target_motion=100)
+        game.update(0.1, pose(0.1, left_hand=(-0.8, 1.1), right_hand=(0.8, 0.5)))
+        earned = game.heat
+        game.update(0.2, pose(0.2, left_hand=None, right_hand=(0.8, 0.2)))
+        self.assertGreater(game.heat, earned)
+        self.assertGreater(game.motion_energy, 0)
+
+    def test_hand_teleports_and_invalid_coordinates_do_not_score(self):
+        game = self.hand_game(left_hand=(0, 0))
+        game.update(0.1, pose(0.1, left_hand=(5, 5)))
+        game.update(0.2, pose(0.2, left_hand=(5, 5)))
+        self.assertEqual(game.heat, 0)
+        invalid = (None, (float("nan"), 0), (0, float("inf")), (7, 0), ("x", 1), (1,), "bad")
+        for i, point in enumerate(invalid, 3):
+            t = i / 10
+            game.update(t, pose(t, left_hand=point))
+            self.assertEqual(game.heat, 0)
+            self.assertEqual(game.motion_energy, 0)
+        game.update(1, pose(1, left_hand=(-1, -1)))
+        self.assertEqual(game.heat, 0)
+
+    def test_person_or_scale_jump_resets_both_hand_baselines(self):
+        for x, scale in ((0.95, 0.2), (0.5, 0.4)):
+            with self.subTest(x=x, scale=scale):
+                game = self.hand_game(left_hand=(-0.8, 0.8), right_hand=(0.8, 0.8))
+                for t in (0.1, 0.2):
+                    game.update(t, pose(t, x=x, scale=scale, left_hand=(1, -1), right_hand=(-1, 2)))
+                self.assertEqual(game.heat, 0)
+                self.assertEqual(game.motion_energy, 0)
+
+    def test_broad_waves_at_three_tracking_fps_are_not_rejected_as_teleports(self):
+        game = self.hand_game(left_hand=(-1, 1))
+        game.update(1 / 3, pose(1 / 3, left_hand=(1, -1)))
+        self.assertGreater(game.heat, 0)
+        self.assertGreater(game.motion_energy, 0)
+
+    def test_hand_scoring_is_comparable_at_three_ten_fifteen_and_thirty_fps(self):
+        scores = []
+        for fps in (3, 10, 15, 30):
+            game = self.hand_game(left_hand=(0.8, -1.2), target_motion=100)
+            for i in range(1, fps * 9 + 1):
+                t = i / fps
+                phase = t % 3
+                y = -1.2 + 1.6 * phase if phase < 1.5 else 1.2 - 1.6 * (phase - 1.5)
+                game.update(t, pose(t, left_hand=(0.8, y)))
+            scores.append(game.heat)
+        self.assertGreater(min(scores), 0)
+        self.assertLess(max(scores) / min(scores), 1.25)
+
+    def test_combined_body_and_two_hands_have_one_shared_scoring_cap(self):
+        game = self.hand_game(left_hand=(-0.8, 0.8), right_hand=(0.8, 0.8))
+        for i in range(1, 61):
+            t = i / 30
+            wave = 1.4 * math.sin(t * math.tau)
+            game.update(t, pose(t, x=0.5 + 0.1 * math.sin(t * math.tau),
+                                left_hand=(-0.8, 0.8 + wave), right_hand=(0.8, 0.8 - wave)))
+            self.assertLessEqual(game.motion_energy, 1)
+            self.assertLessEqual(math.hypot(game.motion_x, game.motion_y), 1.00000001)
+        self.assertEqual(game.state, "playing")
+        self.assertLessEqual(game.heat, 2 * game.config.max_combined_speed / game.config.target_motion + 1e-8)
+
+    def test_feedback_is_once_per_observation_and_clears_on_loss_or_preparation(self):
+        for explicit_absence in (True, False):
+            with self.subTest(explicit_absence=explicit_absence):
+                game = self.hand_game()
+                sample = pose(0.1, left_hand=(0.8, 1.2))
+                game.update(0.1, sample)
+                feedback = game.motion_x, game.motion_y, game.motion_energy, game.motion_timestamp
+                game.update(0.15, sample)
+                self.assertEqual((game.motion_x, game.motion_y, game.motion_energy, game.motion_timestamp), feedback)
+                game.update(0.6, pose(0.6, present=False) if explicit_absence else None)
+                self.assertEqual((game.motion_x, game.motion_y, game.motion_energy), (0, 0, 0))
+                self.assertIsNone(game.motion_timestamp)
+                game.begin(0.7)
+                game.update(0.8, pose(0.8, left_hand=(-1, -1)))
+                self.assertEqual((game.motion_x, game.motion_y, game.motion_energy), (0, 0, 0))
+                self.assertIsNone(game.motion_timestamp)
+
+    def test_body_sway_produces_horizontal_feedback_without_hands(self):
+        game = self.start()
+        game.update(0.1, pose(0.1, x=0.54))
+        self.assertGreater(game.motion_x, 0)
+        self.assertEqual(game.motion_y, 0)
+        self.assertGreater(game.motion_energy, 0)
 
     def test_render_frame_rate_cannot_multiply_points(self):
         def run(render_fps):

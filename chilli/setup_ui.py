@@ -1,4 +1,4 @@
-"""Camera setup screen; consumes snapshots and never opens a device itself."""
+"""Camera settings screen; consumes snapshots and never opens a device itself."""
 from __future__ import annotations
 
 import pygame
@@ -46,10 +46,10 @@ class SetupScreen:
         s.fill(CREAM)
         self.actions = []
         s.blit(r.small_pepper, (55, 17))
-        r.text("CHILLI SHIMMY", (116, 36), 23, RED, True)
-        r.text("SET UP YOUR SPACE", (1216, 46), 16, MUTED, True, "midright")
+        r.text("How HOT are you", (116, 36), 23, RED, True)
+        r.text("SETTINGS", (1216, 46), 16, MUTED, True, "midright")
         pygame.draw.line(s, (224, 203, 180), (64, 87), (1216, 87))
-        r.text("A quick camera check.", (64, 104), 36, INK, True)
+        r.text("Camera settings", (64, 104), 36, INK, True)
         r.text("Find your webcam. Check your framing. Then bring the heat.", (65, 148), 18, MUTED)
 
         viewport = pygame.Rect(64, 187, 720, 390)
@@ -68,12 +68,27 @@ class SetupScreen:
                                     (zone[1]-zone[0])*box.width, box.height-24)
             pygame.draw.rect(s, (255, 219, 120), zone_rect, 2, border_radius=8)
             points = getattr(snapshot, "landmarks", ())
-            for a, b in ((11, 12), (11, 23), (12, 24), (23, 24)):
-                if len(points) > max(a, b) and points[a][0] >= 0 and points[b][0] >= 0:
-                    start = (int(box.x+points[a][0]*box.width), int(box.y+points[a][1]*box.height))
-                    end = (int(box.x+points[b][0]*box.width), int(box.y+points[b][1]*box.height))
+
+            def joint(index):
+                if len(points) > index and all(0 <= value <= 1 for value in points[index]):
+                    return (int(box.x+points[index][0]*box.width),
+                            int(box.y+points[index][1]*box.height))
+                return None
+
+            for a, b in ((11, 12), (11, 23), (12, 24), (23, 24),
+                         (11, 13), (13, 15), (12, 14), (14, 16)):
+                start, end = joint(a), joint(b)
+                if start is not None and end is not None:
                     pygame.draw.line(s, (103, 255, 166), start, end, 3)
-                    pygame.draw.circle(s, (103, 255, 166), start, 5)
+            for index in (11, 12, 13, 14, 23, 24):
+                point = joint(index)
+                if point is not None:
+                    pygame.draw.circle(s, (103, 255, 166), point, 5)
+            for index in (15, 16):
+                point = joint(index)
+                if point is not None:
+                    pygame.draw.circle(s, (255, 205, 92), point, 8)
+                    pygame.draw.circle(s, CREAM, point, 8, 2)
         else:
             # A simple camera glyph remains legible if the webcam is absent.
             pygame.draw.rect(s, (124, 117, 102), (379, 304, 90, 62), 3, border_radius=12)
@@ -118,16 +133,18 @@ class SetupScreen:
 
         sample = getattr(snapshot, "sample", None)
         visible = fresh and sample is not None and sample.present
+        hands = sum(getattr(sample, name, None) is not None for name in ("left_hand", "right_hand"))
         r.text("Camera ready" if fresh else "Camera not ready", (65, 589), 18, GREEN if fresh else RED, True)
-        r.text("Body detected" if visible else "Keep shoulders and hips inside the guide", (242, 589), 17, GREEN if visible else MUTED)
+        r.text(f"Body detected  /  Hands: {hands}/2" if visible else "Keep shoulders and hips inside the guide",
+               (242, 589), 17, GREEN if visible else MUTED)
         r.text(f"{getattr(snapshot, 'fps', 0):.0f} tracking fps", (782, 592), 15, MUTED, anchor="topright")
         status = notice or getattr(snapshot, "status", "Choose a camera to begin")
         r.text(self._fit_text(status, 720, 16), (65, 619), 16, MUTED)
-        self._button("Keyboard demo", (64, 650, 248, 42), ("demo", None))
-        r.text("No webcam needed", (330, 671), 16, MUTED, anchor="midleft")
-        self._button("Start game" if can_start else "Waiting for camera", (832, 598, 364, 54), ("start", None),
+        self._button("Back", (64, 650, 160, 42), ("back", None))
+        self._button("Keyboard demo", (244, 650, 260, 42), ("demo", None))
+        self._button("Save & Back", (832, 598, 364, 54), ("save", None),
                      enabled=can_start, primary=True)
-        r.text("ENTER start   /   K demo   /   F5 refresh", (1014, 680), 14, MUTED, anchor="center")
+        r.text("ENTER save   /   K demo   /   ESC back", (1014, 680), 14, MUTED, anchor="center")
         return s
 
 

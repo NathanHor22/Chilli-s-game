@@ -6,11 +6,17 @@ import math
 import random
 import pygame
 
+from .balloon import Balloon, PLAY_BOUNDS
+
 CREAM = (255, 246, 233)
 INK = (64, 36, 26)
 RED = (218, 45, 34)
 MUTED = (145, 111, 90)
 GREEN = (60, 101, 45)
+BLACK = (0, 0, 0)
+LIGHT_TEXT = (255, 255, 255)
+SOFT_TEXT = (210, 210, 210)
+HOT_TEXT = (255, 141, 98)
 
 
 def curve(start, *segments):
@@ -79,18 +85,24 @@ def encouragement(heat, player_visible=True):
     if not player_visible:
         return "Step back into view"
     if heat < .25:
-        return "Sway left and right"
+        return "Bring the heat!"
     if heat < .5:
         return "Keep going!"
     if heat < .8:
-        return "Getting hotter!"
+        return "Scorching moves!"
     return "Almost there!"
 
 
-def _sway_person(lean):
+def heat_rating(heat, won=False):
+    if won:
+        return "Volcanic"
+    return "Warm" if heat < .4 else "Spicy" if heat < .8 else "Scorching"
+
+
+def _sway_person(lean, wave):
     """Pre-render one rounded silhouette pose at 2x for smooth projection."""
     surface = pygame.Surface((640, 640), pygame.SRCALPHA)
-    color = (59, 83, 60)
+    color = (174, 220, 161)
     def pt(x, y):
         return (round(x*2), round(y*2))
     def limb(points, width):
@@ -101,7 +113,6 @@ def _sway_person(lean):
     hips = 160 + lean*8
     shoulders = 160 + lean*33
     head = 160 + lean*46
-    pygame.draw.ellipse(surface, (220, 207, 184, 100), (174, 592, 292, 22))
     for side in (-1, 1):
         limb([(hips+side*17, 209), (160+side*32+lean*8, 254), (160+side*49, 292)], 22)
         limb([(160+side*49, 292), (160+side*61, 295)], 18)
@@ -109,8 +120,9 @@ def _sway_person(lean):
     limb([(head, 95), (shoulders, 129)], 18)
     pygame.draw.circle(surface, color, pt(head, 74), 45)
     for side in (-1, 1):
-        limb([(shoulders+side*29, 136), (shoulders+side*57, 176),
-              (hips+side*55, 207)], 18)
+        lift = (wave*side+1)/2
+        limb([(shoulders+side*29, 136), (shoulders+side*58, 146-lift*33),
+              (shoulders+side*(82-lift*7), 133-lift*76)], 18)
     return pygame.transform.smoothscale(surface, (320, 320))
 
 
@@ -124,12 +136,26 @@ class Renderer:
         # illustration's asymmetric empty margins before centring/scaling it.
         self.hero_pepper = self.pepper.subsurface(self.pepper.get_bounding_rect()).copy()
         self.sprite_cache = OrderedDict()
+        self.balloon_cache = OrderedDict()
+        self.balloon = Balloon()
+        self._play_identity = None
+        self._previous_state = None
+        self._previous_remaining = None
+        self.balloon_rect = None
         self.background = self._background()
         self.small_pepper = pygame.transform.smoothscale(self.pepper, (58, 58))
-        self.people = tuple(_sway_person(index/10).convert_alpha() for index in range(-10, 11))
-        rng = random.Random(21)
-        self.confetti = [(rng.uniform(210, 1070), rng.uniform(-150, 400), rng.uniform(30, 90),
-                          rng.choice([RED, (248, 161, 67), GREEN]), rng.uniform(0, 6.28)) for _ in range(28)]
+        self.people = tuple(_sway_person(math.sin(index*math.tau/24)*.65,
+                                        math.sin(index*math.tau/12)).convert_alpha()
+                            for index in range(24))
+
+    @property
+    def impact_serial(self):
+        """Monotonic visual impact counter; callers may use changes for audio."""
+        return self.balloon.impact_serial
+
+    @property
+    def movement_energy(self):
+        return self.balloon.movement_energy
 
     def font(self, size, bold=False):
         key = (size, bold)
@@ -149,8 +175,7 @@ class Renderer:
         return rect
 
     def _background(self):
-        # Retained for existing operator/setup consumers; gameplay uses a plain
-        # cream canvas so the moving chilli is the clear focus.
+        # Retained for operator/setup consumers; the game uses pure black.
         bg = pygame.Surface((1280, 720)).convert()
         bg.fill(CREAM)
         pygame.draw.rect(bg, (255, 240, 220), (0, 0, 1280, 8))
@@ -181,6 +206,46 @@ class Renderer:
         self.canvas.blit(sprite, rect)
         return rect
 
+    def _balloon_sprite(self, heat):
+        # Cap the *transformed* footprint, leaving travel space even at full heat.
+        # Quantisation and a small LRU keep transforms and memory bounded.
+        sx, sy = self.balloon.stretch
+        key = (round((225+heat*120)/8)*8, round(self.balloon.angle/3)*3,
+               round(sx*20), round(sy*20))
+        if key not in self.balloon_cache:
+            base = self._sprite(key[0], key[1])
+            width, height = max(1, round(base.get_width()*key[2]/20)), max(1, round(base.get_height()*key[3]/20))
+            fit = min(1., 390/width, 330/height)
+            size = (max(1, round(width*fit)), max(1, round(height*fit)))
+            self.balloon_cache[key] = pygame.transform.scale(base, size)
+            if len(self.balloon_cache) > 24:
+                self.balloon_cache.popitem(last=False)
+        self.balloon_cache.move_to_end(key)
+        return self.balloon_cache[key]
+
+    def _playing_balloon(self, game, now, heat):
+        identity = (id(game), getattr(game, "round_number", None))
+        new_round = (self._previous_state != "playing" or self._play_identity != identity
+                     or (self._previous_remaining is not None and game.remaining > self._previous_remaining+.1))
+        if new_round:
+            self.balloon.reset(now)
+        self._play_identity = identity
+        sprite = self._balloon_sprite(heat)
+        self.balloon.update(now,
+            motion_timestamp=getattr(game, "motion_timestamp", None) if game.player_visible else None,
+            motion_x=getattr(game, "motion_x", 0.), motion_y=getattr(game, "motion_y", 0.),
+            energy=getattr(game, "motion_energy", 0.),
+            half_width=sprite.get_width()/2+2, half_height=sprite.get_height()/2+2)
+        sprite = self._balloon_sprite(heat)
+        # Growth or a collision can change the footprint during this frame.
+        self.balloon.constrain(sprite.get_width()/2+2, sprite.get_height()/2+2, now)
+        self.balloon_rect = sprite.get_rect(center=(round(self.balloon.x), round(self.balloon.y)))
+        previous_clip = self.canvas.get_clip()
+        left, top, right, bottom = PLAY_BOUNDS
+        self.canvas.set_clip(pygame.Rect(left, top, right-left, bottom-top))
+        self.canvas.blit(sprite, self.balloon_rect)
+        self.canvas.set_clip(previous_clip)
+
     @staticmethod
     def demo_start_hit(point, state):
         return bool(point is not None and state in ("idle", "won", "timeout", "clear")
@@ -188,25 +253,22 @@ class Renderer:
 
     def _start_prompt(self, label):
         box = pygame.Rect(DEMO_START_RECT)
-        pygame.draw.rect(self.canvas, RED, box, border_radius=33)
-        self.text(label, box.center, 25, CREAM, True, "center")
+        self.text(label, box.center, 25, LIGHT_TEXT, True, "center")
 
     def _arrow(self, center, direction, active):
         x, y = center
-        color = RED if active else (221, 202, 177)
+        color = HOT_TEXT if active else (130, 130, 130)
         pygame.draw.line(self.canvas, color, (x-direction*19, y), (x+direction*19, y), 9)
         pygame.draw.polygon(self.canvas, color, [(x+direction*35, y),
                             (x+direction*8, y-23), (x+direction*8, y+23)])
 
     def _how_to(self, game, now, demo):
         instructions = game.state == "instructions"
-        self.text("HOW TO PLAY" if instructions else "CHILLI SHIMMY", (640, 45), 18, RED, True, "center")
-        self.text("Sway left. Sway right.", (640, 105), 58, INK, True, "center")
-        self.text("Your moves make the chilli grow.", (640, 161), 26, MUTED, False, "center")
+        self.text("HOW TO PLAY" if instructions else "How HOT are you", (640, 45), 18, HOT_TEXT, True, "center")
+        self.text("Sway or wave your hands", (640, 105), 52, LIGHT_TEXT, True, "center")
+        self.text("Your moves make the chilli grow.", (640, 161), 26, SOFT_TEXT, False, "center")
         phase = math.sin(now*1.8)
-        person = self.people[max(0, min(20, round(phase*10)+10))]
-        pygame.draw.circle(self.canvas, (250, 234, 211), (388, 335), 142)
-        pygame.draw.circle(self.canvas, (255, 235, 211), (928, 335), 142)
+        person = self.people[int(now*1.8/math.tau*24) % len(self.people)]
         self.canvas.blit(person, person.get_rect(center=(388, 328)))
         self._arrow((190, 330), -1, phase < -.12)
         self._arrow((586, 330), 1, phase > .12)
@@ -218,13 +280,16 @@ class Renderer:
         # teaches that cumulative response instead of shrinking on a left lean.
         teaching_growth = (now % 4.0) / 4.0
         self._hero(175 + teaching_growth*110, phase*5, (928, 331))
-        self.text("ALTERNATE LEFT / RIGHT" if demo else "SWAY SIDE TO SIDE",
-                  (388, 505), 19, MUTED, True, "center")
-        self.text("WATCH IT GROW", (928, 505), 19, MUTED, True, "center")
+        self.text("Arrows / A D: sway" if demo else "SWAY OR WAVE",
+                  (388, 505), 19, SOFT_TEXT, True, "center")
+        if demo:
+            self.text("Up Down / W S: wave", (388, 532), 19, SOFT_TEXT, True, "center")
+        self.text("WATCH IT GROW", (928, 505), 19, SOFT_TEXT, True, "center")
         self.text(f"Grow it to full size in {game.config.round_seconds:g} seconds.",
-                  (640, 557), 32, INK, True, "center")
+                  (640, 577), 30, LIGHT_TEXT, True, "center")
         if instructions:
-            self.text("Your turn in a moment", (640, 644), 25, MUTED, False, "center")
+            self.text(getattr(game, "message", "") or "Your turn in a moment",
+                      (640, 644), 25, SOFT_TEXT, False, "center")
         elif demo:
             self._start_prompt("Press Enter or Space to start")
         else:
@@ -234,53 +299,69 @@ class Renderer:
         state = game.state
         heat = max(0., min(1., game.heat))
         if state == "won":
-            self.text("You're on fire!", (640, 89), 66, RED, True, "center")
-            self._hero(420, math.sin(now*6)*6, (640, 346))
-            for x, y, speed, color, phase in self.confetti:
-                cy = (y + now*speed) % 390 + 140
-                cx = x + math.sin(now*3+phase)*13
-                pygame.draw.rect(self.canvas, color, (cx, cy, 5, 9), border_radius=2)
-            bottom = "Maximum heat. You did it!"
+            self.text("You're on fire!", (640, 75), 62, HOT_TEXT, True, "center")
+            self._hero(345+math.sin(now*9)*15, math.sin(now*7)*10, (640, 342+math.sin(now*5)*13))
+            bottom = "Certified spicy!"
         elif state == "timeout":
-            self.text("One more shimmy?", (640, 95), 60, INK, True, "center")
-            self._hero(280+heat*150, math.sin(now*1.8)*2, (640, 346))
+            self.text("Nice moves!", (640, 75), 60, LIGHT_TEXT, True, "center")
+            self._hero(240+heat*110, math.sin(now*1.8)*3, (640, 342))
             bottom = "Give it another go!"
         else:
-            self.text("Ready for the next round?", (640, 105), 52, INK, True, "center")
+            self.text("Ready for the next round?", (640, 105), 52, LIGHT_TEXT, True, "center")
             self._hero(330, math.sin(now*1.8)*3, (640, 344))
             bottom = "Let's turn up the heat again." if demo else "Step out of the play area to reset."
+        if state in ("won", "timeout"):
+            self.text(heat_rating(heat, state == "won").upper(), (640, 134), 24, HOT_TEXT, True, "center")
+            elapsed, best = getattr(game, "result_elapsed", None), getattr(game, "best_time", None)
+            parts = []
+            if state == "won" and elapsed is not None:
+                parts.append(f"{'New record! ' if getattr(game, 'new_record', False) else ''}{elapsed:.1f}s")
+            if best is not None:
+                parts.append(f"Best: {best:.1f}s")
+            if parts:
+                self.text("   |   ".join(parts), (640, 555), 25, SOFT_TEXT, True, "center")
+            if demo:
+                self._start_prompt("Press Enter or Space to play again")
+            else:
+                self.text(bottom, (640, 640), 34, LIGHT_TEXT, True, "center")
+            return
         if demo:
-            self.text(bottom, (640, 568), 30, INK, True, "center")
+            self.text(bottom, (640, 568), 30, LIGHT_TEXT, True, "center")
             self._start_prompt("Press Enter or Space to play again")
         else:
-            self.text(bottom, (640, 640), 34, INK, True, "center")
+            self.text(bottom, (640, 640), 34, LIGHT_TEXT, True, "center")
 
     def draw(self, game, now, *, demo=False, muted=False, diagnostics=False,
              snapshot=None, render_fps=0., zone=(.15, .85)):
-        self.canvas.fill(CREAM)
+        self.canvas.fill(BLACK)
         state = game.state
         heat = max(0., min(1., game.heat))
+        if state != "playing" and self._previous_state == "playing":
+            self.balloon.reset(now)
+            self._play_identity = None
+            self.balloon_rect = None
         if state in ("idle", "instructions"):
             self._how_to(game, now, demo)
         elif state == "playing":
-            angle = math.sin(now*2)*1.2 + max(-1., min(1., game.sway))*6
-            self._hero(260 + heat*240, angle)
+            self._playing_balloon(game, now, heat)
             seconds = max(0, math.ceil(game.remaining))
             self.text(f"{seconds:02d}s", (1216, 69), 54,
-                      RED if game.remaining <= 3 else INK, True, "topright")
-            self.text(encouragement(heat, game.player_visible), (640, 650), 43, INK, True, "center")
+                      HOT_TEXT if game.remaining <= 3 else LIGHT_TEXT, True, "topright")
+            self.text(encouragement(heat, game.player_visible), (640, 650), 43, LIGHT_TEXT, True, "center")
         elif state == "countdown":
             self._hero(285, math.sin(now*2)*2, (640, 360))
-            self.text(str(game.countdown or 1), (640, 108), 104, RED, True, "center")
-            self.text("Get ready to sway", (640, 650), 38, INK, True, "center")
+            self.text(str(game.countdown or 1), (640, 108), 104, HOT_TEXT, True, "center")
+            self.text("Get ready to move", (640, 650), 38, LIGHT_TEXT, True, "center")
         elif state in ("won", "timeout", "clear"):
             self._result(game, now, demo)
         else:
-            self.text("Finding your camera...", (640, 128), 52, INK, True, "center")
+            self.text("Finding your camera...", (640, 128), 52, LIGHT_TEXT, True, "center")
             self._hero(320, 0, (640, 370))
-            self.text("Please wait a moment.", (640, 640), 30, MUTED, False, "center")
+            self.text("Please wait a moment.", (640, 640), 30, SOFT_TEXT, False, "center")
         if diagnostics:
             self._diagnostics(snapshot, render_fps, game, zone)
+        self._previous_state = state
+        self._previous_remaining = game.remaining if state == "playing" else None
         return self.canvas
 
     def _diagnostics(self, snapshot, fps, game, zone):
@@ -312,4 +393,4 @@ class Renderer:
             if y > 463:
                 break
         self.text(line, (76, y), 15, (255, 219, 170))
-        self.text("F2 close   C setup   F fullscreen   M sound   ESC quit", (76, 502), 14, (230, 230, 220))
+        self.text("F2 close   C settings   F fullscreen   M sound   ESC menu", (76, 502), 14, (230, 230, 220))

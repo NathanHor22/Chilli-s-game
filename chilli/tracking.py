@@ -128,8 +128,22 @@ def _pose_sample(
     lean = (shoulder_x - hip_x) / shoulder_span
     if abs(lean) > 2.0:
         return absent, landmarks, "Keep your shoulders and hips in view"
+
+    def hand_position(index: int) -> tuple[float, float] | None:
+        # Pose already includes wrists: no second model is needed. Coordinates
+        # are relative to the shoulder centre, with both axes in shoulder-width
+        # units so body translation and image aspect ratio do not add hand speed.
+        wrist_x, wrist_y = landmarks[index]
+        if wrist_x < 0.0:
+            return None
+        return (
+            (wrist_x - shoulder_x) / shoulder_span,
+            (wrist_y - shoulder_y) * frame_height / frame_width / shoulder_span,
+        )
+
     return (
-        PoseSample(timestamp=timestamp, present=True, x=shoulder_x, scale=shoulder_span, lean=lean),
+        PoseSample(timestamp=timestamp, present=True, x=shoulder_x, scale=shoulder_span, lean=lean,
+                   left_hand=hand_position(15), right_hand=hand_position(16)),
         landmarks,
         "Player detected",
     )
@@ -237,7 +251,8 @@ class CameraTracker:
             self._preview_enabled = bool(enabled)
             if not enabled and self._snapshot.preview is not None:
                 old = self._snapshot
-                self._snapshot = TrackingSnapshot(old.sample, old.ready, old.status, old.fps)
+                self._snapshot = TrackingSnapshot(old.sample, old.ready, old.status, old.fps,
+                                                  landmarks=old.landmarks)
 
     def _publish(self, snapshot: TrackingSnapshot) -> None:
         with self._lock:
@@ -409,10 +424,11 @@ class CameraTracker:
                 if self.config.mirror:
                     frame = cv2.flip(frame, 1)
                 frame_height, frame_width = frame.shape[:2]
-                crop_left = int(self.config.zone_left * frame_width)
-                crop_right = max(crop_left + 1, int(self.config.zone_right * frame_width))
-                cropped_rgb = cv2.cvtColor(frame[:, crop_left:crop_right], cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cropped_rgb)
+                # Hands may extend outside the torso's marked play zone. Give
+                # the same Lite pose model the full view, then gate the shoulder
+                # centre in _pose_sample rather than clipping visible wrists.
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp_ms = max(last_ms + 1, int(observed_at * 1000))
                 last_ms = timestamp_ms
                 with self._lock:
@@ -424,7 +440,7 @@ class CameraTracker:
                     break
                 sample, landmarks, status = _pose_sample(
                     result, observed_at, self.config, frame_width, frame_height,
-                    crop_left, crop_right - crop_left,
+                    0, frame_width,
                 )
                 if observed_at < warmup_until:
                     sample = PoseSample(timestamp=observed_at, present=False)
@@ -447,7 +463,7 @@ class CameraTracker:
                         self._snapshot = TrackingSnapshot(
                             sample=sample, ready=True, status=status, fps=measured_fps,
                             preview=preview if self._preview_enabled else None,
-                            landmarks=landmarks if self._preview_enabled else (),
+                            landmarks=landmarks,
                         )
         except Exception as exc:
             # Surface boot/model failures in the game instead of dying silently.

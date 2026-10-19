@@ -75,6 +75,8 @@ class DiscoveryTests(unittest.TestCase):
             wait_for(lambda: "failed" in discovery.snapshot().status)
             self.assertEqual(discovery.snapshot().cameras, (camera,))
             self.assertEqual(discovery.snapshot().generation, 1)
+            self.assertEqual(discovery.snapshot().revision, 2)
+            self.assertTrue(discovery.snapshot().error)
             self.assertFalse(discovery.snapshot().scanning)
         finally:
             discovery.stop()
@@ -106,6 +108,71 @@ class DiscoveryTests(unittest.TestCase):
         finally:
             release.set()
             discovery._thread.join(timeout=1)
+
+    def test_refresh_during_scan_is_queued_and_coalesced_without_overlap(self):
+        first_entered, first_release = threading.Event(), threading.Event()
+        second_entered, second_release = threading.Event(), threading.Event()
+        camera = CameraInfo(2, "New USB webcam", 700, "new-device")
+        calls = []
+        active = []
+
+        def enumerate_fn():
+            self.assertEqual(active, [], "Discovery scans overlapped")
+            active.append(True)
+            calls.append(len(calls)+1)
+            try:
+                if len(calls) == 1:
+                    first_entered.set()
+                    first_release.wait()
+                    return ()
+                second_entered.set()
+                second_release.wait()
+                return (camera,)
+            finally:
+                active.clear()
+
+        discovery = CameraDiscovery(60, enumerate_fn=enumerate_fn)
+        discovery.start()
+        self.assertTrue(first_entered.wait(1))
+        try:
+            discovery.refresh()
+            discovery.refresh()
+            self.assertTrue(discovery.snapshot().scanning)
+            first_release.set()
+            self.assertTrue(second_entered.wait(1), "Refresh made during a scan was lost")
+            snapshot = discovery.snapshot()
+            self.assertTrue(snapshot.scanning)
+            self.assertEqual(snapshot.revision, 1)
+            second_release.set()
+            wait_for(lambda: discovery.snapshot().revision == 2 and not discovery.snapshot().scanning)
+            self.assertEqual(discovery.snapshot().cameras, (camera,))
+            self.assertEqual(calls, [1, 2])
+        finally:
+            first_release.set()
+            second_release.set()
+            discovery.stop()
+
+    def test_refresh_marks_scanning_before_background_worker_finishes(self):
+        release = threading.Event()
+        calls = []
+
+        def enumerate_fn():
+            calls.append(True)
+            if len(calls) > 1:
+                release.wait()
+            return ()
+
+        discovery = CameraDiscovery(60, enumerate_fn=enumerate_fn)
+        discovery.start()
+        try:
+            wait_for(lambda: discovery.snapshot().revision == 1)
+            self.assertFalse(discovery.snapshot().scanning)
+            discovery.refresh()
+            self.assertTrue(discovery.snapshot().scanning)
+            self.assertIn("Looking", discovery.snapshot().status)
+        finally:
+            release.set()
+            discovery.stop()
 
 
 class FakeTracker:

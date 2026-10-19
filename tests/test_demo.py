@@ -150,6 +150,43 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.game.state, "won")
         self.assertGreater(self.game.remaining, 0)
 
+    def test_vertical_hand_only_keys_can_win_without_body_sway(self):
+        for keys in ((pygame.K_UP, pygame.K_DOWN), (pygame.K_w, pygame.K_s)):
+            with self.subTest(keys=keys):
+                self.setUp()
+                self.start_playing()
+                held = None
+                saw_vertical_feedback = False
+                for frame in range(300):
+                    key = keys[(frame // 12) % 2]
+                    if key != held:
+                        if held is not None:
+                            self.event(pygame.KEYUP, held)
+                        self.event(pygame.KEYDOWN, key)
+                        held = key
+                    self.frame()
+                    self.assertEqual(self.demo.x, 0.5)
+                    saw_vertical_feedback |= abs(self.game.motion_y) > 0.1
+                    if self.game.state == "won":
+                        break
+                self.assertTrue(saw_vertical_feedback)
+                self.assertEqual(self.game.state, "won")
+                self.assertGreater(self.game.remaining, 0)
+
+    def test_vertical_tap_is_preserved_and_focus_loss_releases_it(self):
+        self.start_playing()
+        self.tap(pygame.K_w)
+        samples = [self.frame() for _ in range(5)]
+        self.assertLess(min(sample.right_hand[1] for sample in samples), 0.5)
+        self.assertGreater(self.game.heat, 0)
+        self.event(pygame.KEYDOWN, pygame.K_s)
+        self.frame()
+        self.demo.handle_event(pygame.event.Event(pygame.WINDOWFOCUSLOST), self.now)
+        for _ in range(45):
+            self.frame()
+        self.assertEqual(self.demo.hand_direction, 0)
+        self.assertAlmostEqual(self.demo.hand_y, 0.8, places=4)
+
     def test_no_input_times_out_with_zero_heat_then_enter_retries(self):
         self.start_playing()
         for _ in range(305):

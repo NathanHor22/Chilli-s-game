@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -87,6 +88,46 @@ class SetupScreenTests(unittest.TestCase):
         # Invalid/unseen joints stay outside the render path.
         self.assertEqual(surface.get_at((200, 260))[:3], (12, 34, 56))
 
+    def test_preview_draws_arm_connections_and_distinct_hand_markers(self):
+        points = [(-1.0, -1.0)] * 33
+        points[11], points[12] = (0.35, 0.35), (0.65, 0.35)
+        points[13], points[14] = (0.25, 0.45), (0.75, 0.45)
+        points[15], points[16] = (0.15, 0.55), (0.85, 0.55)
+        points[23], points[24] = (0.4, 0.7), (0.6, 0.7)
+        self.snapshot = TrackingSnapshot(
+            sample=PoseSample(100, True, left_hand=(-1, 1), right_hand=(1, 1)),
+            ready=True, preview=self.frame, landmarks=tuple(points),
+        )
+        surface = self.draw()
+        # Same fitted 520x390 image at (164,187), including arm midpoints.
+        self.assertEqual(surface.get_at((320, 342))[:3], (103, 255, 166))
+        self.assertEqual(surface.get_at((268, 382))[:3], (103, 255, 166))
+        for wrist in ((242, 401), (606, 401)):
+            self.assertEqual(surface.get_at(wrist)[:3], (255, 205, 92))
+
+    def test_hand_markers_do_not_require_visible_elbows_and_skip_occluded_wrists(self):
+        points = [(-1.0, -1.0)] * 33
+        points[15] = (0.15, 0.55)
+        self.snapshot = TrackingSnapshot(
+            sample=PoseSample(100, True, left_hand=(-1, 1)), ready=True,
+            preview=self.frame, landmarks=tuple(points),
+        )
+        surface = self.draw()
+        self.assertEqual(surface.get_at((242, 401))[:3], (255, 205, 92))
+        self.assertEqual(surface.get_at((606, 401))[:3], (22, 111, 88))
+
+    def test_live_body_status_reports_zero_one_or_two_detected_hands(self):
+        for count, hands in enumerate(({}, {"left_hand": (-1, 1)},
+                                       {"left_hand": (-1, 1), "right_hand": (1, 1)})):
+            with self.subTest(count=count):
+                self.snapshot = TrackingSnapshot(
+                    sample=PoseSample(100, True, **hands), ready=True, preview=self.frame,
+                )
+                with patch.object(self.renderer, "text", wraps=self.renderer.text) as text:
+                    self.draw()
+                labels = [str(call.args[0]) for call in text.call_args_list]
+                self.assertIn(f"Body detected  /  Hands: {count}/2", labels)
+
     def test_selected_source_is_highlighted_and_rows_return_the_right_device(self):
         surface = self.draw()
         self.assertEqual(surface.get_at((1000, 212))[:3], RED)
@@ -98,17 +139,31 @@ class SetupScreenTests(unittest.TestCase):
         self.assertIsNone(self.screen.click((424, 400)))  # Preview, not a source.
         self.assertIsNone(self.screen.click(None))
 
-    def test_start_requires_ready_frame_and_stale_preview_is_not_shown(self):
+    def test_save_requires_ready_frame_and_stale_preview_is_not_shown(self):
         surface = self.draw(can_start=False)
         self.assertIsNone(self.screen.click((1014, 625)))
         self.assertEqual(surface.get_at((200, 260))[:3], (46, 43, 36))
         self.assertEqual(self.screen.click((1014, 183)), ("camera", self.cameras[0]))
-        self.assertEqual(self.screen.click((188, 671)), ("demo", None))
+        self.assertEqual(self.screen.click((374, 671)), ("demo", None))
+        self.assertEqual(self.screen.click((144, 671)), ("back", None))
         self.draw(can_start=True)
-        self.assertEqual(self.screen.click((1014, 625)), ("start", None))
+        self.assertEqual(self.screen.click((1014, 625)), ("save", None))
         # Redrawing the disabled state must remove the old enabled hit target.
         self.draw(can_start=False)
         self.assertIsNone(self.screen.click((1014, 625)))
+
+    def test_settings_has_back_and_demo_even_with_no_camera(self):
+        self.snapshot = TrackingSnapshot()
+        self.discovery = DiscoverySnapshot()
+        with patch.object(self.renderer, "text", wraps=self.renderer.text) as text:
+            self.draw(selected=None, can_start=False)
+        labels = [str(call.args[0]) for call in text.call_args_list]
+        for label in ("How HOT are you", "SETTINGS", "Camera settings", "Save & Back", "Back"):
+            self.assertIn(label, labels)
+        self.assertNotIn("Start game", labels)
+        self.assertIsNone(self.screen.click((1014, 625)))
+        self.assertEqual(self.screen.click((144, 671)), ("back", None))
+        self.assertEqual(self.screen.click((374, 671)), ("demo", None))
 
     def test_scrolling_clamps_and_replaces_visible_source_hit_targets(self):
         self.draw()
@@ -146,7 +201,7 @@ class SetupScreenTests(unittest.TestCase):
         self.assertEqual(self.screen.click((854, 510)), ("index", -1))
         self.assertIsNone(self.screen.click((978, 510)))
 
-    def test_letterboxed_window_clicks_select_same_row_and_start_action(self):
+    def test_letterboxed_window_clicks_select_same_row_and_save_action(self):
         self.draw()
         for size in ((640, 360), (1600, 1000), (1920, 720), (1000, 1000)):
             width, height = size
@@ -154,7 +209,8 @@ class SetupScreenTests(unittest.TestCase):
             ox, oy = (width - 1280 * factor) / 2, (height - 720 * factor) / 2
             for point, expected in (
                 ((1014, 236), ("camera", self.cameras[1])),
-                ((1014, 625), ("start", None)),
+                ((1014, 625), ("save", None)),
+                ((144, 671), ("back", None)),
             ):
                 with self.subTest(size=size, action=expected[0]):
                     window_point = (ox + point[0] * factor, oy + point[1] * factor)
