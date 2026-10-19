@@ -1,0 +1,40 @@
+{
+  "display": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "fullscreen": true,
+    "index": 0
+  },
+  "game": {
+    "round_seconds": 10.0,
+    "instructions_seconds": 4.0,
+    "countdown_seconds": 3.0,
+    "settle_seconds": 1.0,
+    "result_seconds": 3.0,
+    "clear_seconds": 1.0,
+    "lost_seconds": 2.0,
+    "stale_seconds": 0.4,
+    "target_motion": 6.0,
+    "noise_speed": 0.1,
+    "max_speed": 3.0
+  },
+  "tracking": {
+    "camera_index": 0,
+    "camera_backend": 700,
+    "camera_path": "\\\\?\\usb#vid_1d6c&pid_1278&mi_00#6&231a6235&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "width": 640,
+    "height": 480,
+    "fps": 15.0,
+    "model_path": "models/pose_landmarker_lite.task",
+    "mirror": true,
+    "zone_left": 0.15,
+    "zone_right": 0.85,
+    "min_shoulder_width": 0.09,
+    "confidence": 0.55
+  },
+  "audio": {
+    "enabled": true,
+    "volume": 0.35
+  }
+}
